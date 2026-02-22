@@ -122,7 +122,7 @@ func run() error {
 		return fmt.Errorf("stream: %w", err)
 	}
 
-	fmt.Printf("\n\n--- Encounter complete. Tokens used: %d ---\n", result.Usage.TotalTokens)
+	fmt.Printf("\n\n--- Encounter complete. Steps: %d ---\n", len(result.Steps))
 	return nil
 }
 
