@@ -5,6 +5,12 @@ dnd-agent
 # Models (downloaded automatically)
 models/
 
+# Nix / direnv
+.direnv/
+
+# Environment
+.env
+
 # OS
 .DS_Store
 Thumbs.db

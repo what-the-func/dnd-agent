@@ -39,6 +39,7 @@ The DM uses these tools to run mechanically accurate encounters with dramatic na
 ```bash
 git clone https://github.com/what-the-func/dnd-agent.git
 cd dnd-agent
+cp .env.example .env
 go run .
 ```
 
@@ -47,6 +48,45 @@ On first run, Kronk automatically downloads:
 2. The Qwen3-8B model (~8GB)
 
 Subsequent runs start immediately from cache.
+
+## GPU Configuration
+
+Copy `.env.example` to `.env` and set `KRONK_PROCESSOR` to match your hardware:
+
+| Value | Backend | Hardware |
+|-------|---------|----------|
+| `cpu` | CPU only | Any (default) |
+| `cuda` | NVIDIA CUDA | NVIDIA GPUs |
+| `vulkan` | Vulkan | NVIDIA, AMD, Intel GPUs |
+| `metal` | Apple Metal | Apple Silicon Macs |
+
+Example `.env` for an NVIDIA GPU with Vulkan:
+
+```bash
+KRONK_PROCESSOR=vulkan
+GGML_VK_VISIBLE_DEVICES=0
+```
+
+If you have multiple GPUs (e.g. discrete + integrated), set the device index to
+target the right one. Run with `DND_DEBUG=1` to list detected devices:
+
+```bash
+DND_DEBUG=1 go run .
+```
+
+**Important:** After changing `KRONK_PROCESSOR`, delete the cached libraries so
+Kronk re-downloads the correct backend build:
+
+```bash
+rm -rf ~/.kronk/libraries
+```
+
+Environment variables set in the shell always override `.env` values, so you can
+do one-off overrides without editing the file:
+
+```bash
+KRONK_PROCESSOR=cuda go run .
+```
 
 ## How It Works
 

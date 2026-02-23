@@ -9,12 +9,16 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/kronk"
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+	"github.com/joho/godotenv"
 )
 
 const modelURL = "Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q8_0.gguf"
@@ -41,10 +45,24 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Create the Kronk provider (local inference)
+	// Load .env file (does not override existing env vars)
+	godotenv.Load()
+
+	// Print GPU diagnostics when DND_DEBUG is set
+	if os.Getenv("DND_DEBUG") != "" {
+		printGPUDiagnostics()
+	}
+
+	// Create the Kronk provider (local inference with GPU acceleration)
+	// Qwen3-8B has 36 layers. Q8_0 is 8.7GB which exceeds 8GB VRAM,
+	// so we offload 28 layers to GPU and keep the rest on CPU.
+	gpuLayers := 24
 	provider, err := kronk.New(
 		kronk.WithName("kronk"),
 		kronk.WithLogger(kronk.FmtLogger),
+		kronk.WithModelConfig(model.Config{
+			NGpuLayers: &gpuLayers,
+		}),
 	)
 	if err != nil {
 		return fmt.Errorf("provider: %w", err)
@@ -288,6 +306,98 @@ func rollDice(ctx context.Context, input diceQuery, _ fantasy.ToolCall) (fantasy
 	result += fmt.Sprintf(" = **%d**", total)
 
 	return fantasy.NewTextResponse(result), nil
+}
+
+// --- GPU Diagnostics ---
+
+func printGPUDiagnostics() {
+	dbg := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
+	}
+
+	dbg("=== GPU Diagnostics ===")
+
+	// LD_LIBRARY_PATH
+	ldPath := os.Getenv("LD_LIBRARY_PATH")
+	if ldPath == "" {
+		dbg("LD_LIBRARY_PATH: (not set)")
+	} else {
+		dbg("LD_LIBRARY_PATH:")
+		for _, p := range strings.Split(ldPath, ":") {
+			dbg("  %s", p)
+		}
+	}
+
+	// Scan for GPU shared libraries
+	libs := map[string]bool{
+		"libcuda.so":   false,
+		"libcudart.so": false,
+		"libcublas.so": false,
+		"libnvcuda.so": false,
+		"libvulkan.so": false,
+	}
+
+	searchPaths := strings.Split(ldPath, ":")
+	searchPaths = append(searchPaths,
+		"/usr/lib/x86_64-linux-gnu",
+		"/usr/lib64",
+		"/usr/local/cuda/lib64",
+		"/run/opengl-driver/lib",
+	)
+
+	for _, dir := range searchPaths {
+		if dir == "" {
+			continue
+		}
+		for lib := range libs {
+			matches, _ := filepath.Glob(filepath.Join(dir, lib+"*"))
+			if len(matches) > 0 {
+				libs[lib] = true
+				dbg("Found %s -> %s", lib, matches[0])
+			}
+		}
+	}
+
+	dbg("Library summary:")
+	for lib, found := range libs {
+		status := "MISSING"
+		if found {
+			status = "found"
+		}
+		dbg("  %-18s %s", lib, status)
+	}
+
+	// nvidia-smi
+	dbg("--- nvidia-smi ---")
+	out, err := exec.Command("nvidia-smi",
+		"--query-gpu=name,driver_version,memory.total,memory.free,compute_cap",
+		"--format=csv,noheader",
+	).CombinedOutput()
+	if err != nil {
+		dbg("nvidia-smi: %v (is the NVIDIA driver installed?)", err)
+	} else {
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			dbg("  %s", line)
+		}
+	}
+
+	// Relevant env vars
+	dbg("--- Environment ---")
+	for _, key := range []string{
+		"CUDA_VISIBLE_DEVICES",
+		"GGML_VK_VISIBLE_DEVICES",
+		"GGML_BACKEND",
+		"CUDA_PATH",
+		"VULKAN_SDK",
+	} {
+		if v := os.Getenv(key); v != "" {
+			dbg("  %s=%s", key, v)
+		} else {
+			dbg("  %s=(not set)", key)
+		}
+	}
+
+	dbg("=== End Diagnostics ===\n")
 }
 
 // --- Helpers ---

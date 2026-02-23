@@ -63,6 +63,7 @@ require (
 	github.com/hashicorp/go-getter v1.8.4 // indirect
 	github.com/hashicorp/go-version v1.8.0 // indirect
 	github.com/hybridgroup/yzma v1.9.0 // indirect
+	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/jupiterrider/ffi v0.6.0 // indirect
 	github.com/kaptinlin/go-i18n v0.2.9 // indirect
