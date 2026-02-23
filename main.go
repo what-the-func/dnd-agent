@@ -27,7 +27,17 @@ const systemPrompt = `You are a D&D 5e Dungeon Master. The player is a level 5 w
 
 Keep responses to 2-3 sentences max. Never ramble. After describing the scene, stop and use ask_player immediately.`
 
-var playerScanner = bufio.NewScanner(os.Stdin)
+var stdinLines = make(chan string)
+
+func init() {
+	go func() {
+		s := bufio.NewScanner(os.Stdin)
+		for s.Scan() {
+			stdinLines <- s.Text()
+		}
+		close(stdinLines)
+	}()
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -75,6 +85,7 @@ func run() error {
 		),
 		fantasy.WithMaxOutputTokens(2048),
 		fantasy.WithTemperature(0.8),
+		fantasy.WithPresencePenalty(1.5),
 	)
 
 	return gameLoop(sigCtx, agent)
@@ -211,7 +222,7 @@ type askPlayerInput struct {
 	Options  []string `json:"options" description:"List of 3-5 options the player can choose from"`
 }
 
-func askPlayer(_ context.Context, input askPlayerInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+func askPlayer(ctx context.Context, input askPlayerInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	fmt.Printf("\n\n--- YOUR TURN ---\n%s\n\n", input.Question)
 	for i, opt := range input.Options {
 		fmt.Printf("  %d. %s\n", i+1, opt)
@@ -220,20 +231,24 @@ func askPlayer(_ context.Context, input askPlayerInput, _ fantasy.ToolCall) (fan
 	for {
 		fmt.Printf("\nChoose [1-%d]: ", len(input.Options))
 
-		if !playerScanner.Scan() {
-			return fantasy.NewTextResponse("The player has left the game."), nil
-		}
+		select {
+		case <-ctx.Done():
+			return fantasy.ToolResponse{}, ctx.Err()
+		case line, ok := <-stdinLines:
+			if !ok {
+				return fantasy.NewTextResponse("The player has left the game."), nil
+			}
 
-		text := strings.TrimSpace(playerScanner.Text())
-		choice, err := strconv.Atoi(text)
-		if err != nil || choice < 1 || choice > len(input.Options) {
-			fmt.Printf("Pick a number between 1 and %d.\n", len(input.Options))
-			continue
-		}
+			choice, err := strconv.Atoi(strings.TrimSpace(line))
+			if err != nil || choice < 1 || choice > len(input.Options) {
+				fmt.Printf("Pick a number between 1 and %d.\n", len(input.Options))
+				continue
+			}
 
-		chosen := input.Options[choice-1]
-		fmt.Printf("-> %s\n\n", chosen)
-		return fantasy.NewTextResponse(fmt.Sprintf("The player chose: %s", chosen)), nil
+			chosen := input.Options[choice-1]
+			fmt.Printf("-> %s\n\n", chosen)
+			return fantasy.NewTextResponse(fmt.Sprintf("The player chose: %s", chosen)), nil
+		}
 	}
 }
 
