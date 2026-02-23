@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -9,8 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
@@ -21,18 +21,13 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const modelURL = "Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q8_0.gguf"
+const modelURL = "Qwen/Qwen3-8B-GGUF/Qwen3-8B-Q5_K_M.gguf"
 
-const systemPrompt = `You are an experienced D&D 5th Edition Dungeon Master.
-You have access to tools that let you look up real monster stats, spell details,
-and roll dice. Use them to run vivid, accurate encounters.
+const systemPrompt = `You are a D&D 5e Dungeon Master. The player is a level 5 wizard (32 HP, AC 12) with Fireball, Shield, Misty Step, and Magic Missile prepared. They stand at a dungeon entrance.
 
-When describing combat, always look up the actual monster stats first. When a
-player wants to cast a spell, look up the real spell details. Roll dice for
-attack rolls, damage, and saving throws — never make up results.
+Keep responses to 2-3 sentences max. Never ramble. After describing the scene, stop and use ask_player immediately.`
 
-Be dramatic and descriptive, but keep responses concise. Use the actual game
-mechanics from your tool results.`
+var playerScanner = bufio.NewScanner(os.Stdin)
 
 func main() {
 	if err := run(); err != nil {
@@ -42,210 +37,302 @@ func main() {
 }
 
 func run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	// Load .env file (does not override existing env vars)
 	godotenv.Load()
 
-	// Print GPU diagnostics when DND_DEBUG is set
-	if os.Getenv("DND_DEBUG") != "" {
-		printGPUDiagnostics()
-	}
-
-	// Create the Kronk provider (local inference with GPU acceleration)
-	// Qwen3-8B has 36 layers. Q8_0 is 8.7GB which exceeds 8GB VRAM,
-	// so we offload 28 layers to GPU and keep the rest on CPU.
-	gpuLayers := 24
 	provider, err := kronk.New(
 		kronk.WithName("kronk"),
 		kronk.WithLogger(kronk.FmtLogger),
 		kronk.WithModelConfig(model.Config{
-			NGpuLayers: &gpuLayers,
+			CacheTypeK: model.GGMLTypeQ8_0,
+			CacheTypeV: model.GGMLTypeQ8_0,
+			NBatch:     512,
 		}),
 	)
 	if err != nil {
 		return fmt.Errorf("provider: %w", err)
 	}
 	defer func() {
-		if closer, ok := provider.(interface{ Close(context.Context) error }); ok {
-			closer.Close(context.Background())
+		if c, ok := provider.(interface{ Close(context.Context) error }); ok {
+			c.Close(context.Background())
 		}
 	}()
 
-	// Load the model (auto-downloads on first run)
-	model, err := provider.LanguageModel(ctx, modelURL)
+	llm, err := provider.LanguageModel(sigCtx, modelURL)
 	if err != nil {
 		return fmt.Errorf("model: %w", err)
 	}
 
-	// Build the DM toolkit
-	monsterTool := fantasy.NewAgentTool("lookup_monster",
-		"Look up a D&D 5e monster by name. Returns stats, abilities, and actions.",
-		lookupMonster,
-	)
-
-	spellTool := fantasy.NewAgentTool("lookup_spell",
-		"Look up a D&D 5e spell by name. Returns level, damage, range, components, and description.",
-		lookupSpell,
-	)
-
-	diceTool := fantasy.NewAgentTool("roll_dice",
-		"Roll dice using standard notation like 2d6, 1d20+5, or 8d6.",
-		rollDice,
-	)
-
-	// Create the Dungeon Master agent
-	agent := fantasy.NewAgent(model,
+	agent := fantasy.NewAgent(llm,
 		fantasy.WithSystemPrompt(systemPrompt),
-		fantasy.WithTools(monsterTool, spellTool, diceTool),
+		fantasy.WithTools(
+			playerTool(),
+			monsterTool(),
+			spellTool(),
+			diceTool(),
+		),
 		fantasy.WithMaxOutputTokens(2048),
 		fantasy.WithTemperature(0.8),
 	)
 
-	// Set the scene with streaming
-	streamCall := fantasy.AgentStreamCall{
-		Prompt: `I'm a level 5 wizard exploring a dark cave. I hear a growl 
-		ahead. Set up an encounter with an owlbear. Roll initiative for both 
-		of us, and describe what I see. I want to open with Fireball.`,
+	return gameLoop(sigCtx, agent)
+}
 
-		OnReasoningStart: func(id string, content fantasy.ReasoningContent) error {
-			fmt.Print("\n💭 DM is thinking: ")
-			return nil
-		},
-		OnReasoningDelta: func(id, text string) error {
-			fmt.Print(text)
-			return nil
-		},
-		OnReasoningEnd: func(id string, reasoning fantasy.ReasoningContent) error {
-			fmt.Print("\n\n")
-			return nil
-		},
-		OnTextDelta: func(id, text string) error {
-			fmt.Print(text)
-			return nil
-		},
-		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			fmt.Printf("\n⚔️  [%s] %s\n", tc.ToolName, tc.Input)
-			return nil
-		},
-		OnToolResult: func(res fantasy.ToolResultContent) error {
-			fmt.Println("✅ Result received")
-			return nil
-		},
+// ---------------------------------------------------------------------------
+// Game loop
+// ---------------------------------------------------------------------------
+
+// gameLoop runs the turn-based game indefinitely until Ctrl+C.
+// Each iteration is one DM turn. Conversation history accumulates between turns.
+func gameLoop(sigCtx context.Context, agent fantasy.Agent) error {
+	var history []fantasy.Message
+	prompt := "Begin."
+
+	fmt.Println("=== D&D 5e ===")
+	fmt.Println("Press Ctrl+C to quit")
+	fmt.Println()
+
+	for {
+		ctx, cancel := context.WithTimeout(sigCtx, 30*time.Minute)
+
+		result, err := agent.Stream(ctx, fantasy.AgentStreamCall{
+			Prompt:           prompt,
+			Messages:         history,
+			OnReasoningStart: onReasoningStart,
+			OnReasoningDelta: onReasoningDelta,
+			OnReasoningEnd:   onReasoningEnd,
+			OnTextDelta:      onTextDelta,
+			OnToolCall:       onToolCall,
+			OnToolResult:     onToolResult,
+		})
+		cancel()
+
+		if err != nil {
+			if sigCtx.Err() != nil {
+				fmt.Println("\n\n--- Thanks for playing! ---")
+				return nil
+			}
+			return fmt.Errorf("stream: %w", err)
+		}
+
+		for _, step := range result.Steps {
+			history = append(history, step.Messages...)
+		}
+
+		fmt.Println()
+		prompt = "Continue."
 	}
+}
 
-	result, err := agent.Stream(ctx, streamCall)
-	if err != nil {
-		return fmt.Errorf("stream: %w", err)
-	}
+// ---------------------------------------------------------------------------
+// Stream callbacks
+// ---------------------------------------------------------------------------
 
-	fmt.Printf("\n\n--- Encounter complete. Steps: %d ---\n", len(result.Steps))
+func onReasoningStart(_ string, _ fantasy.ReasoningContent) error {
+	fmt.Println("\n[THINKING...]")
 	return nil
 }
 
-// --- Tool: Monster Lookup ---
+func onReasoningDelta(_, text string) error {
+	fmt.Print(text)
+	return nil
+}
+
+func onReasoningEnd(_ string, _ fantasy.ReasoningContent) error {
+	fmt.Println("\n[END THINKING]\n")
+	return nil
+}
+
+func onTextDelta(_, text string) error {
+	fmt.Print(text)
+	return nil
+}
+
+func onToolCall(tc fantasy.ToolCallContent) error {
+	if tc.ToolName != "ask_player" {
+		fmt.Printf("\n[%s] %s\n", tc.ToolName, tc.Input)
+	}
+	return nil
+}
+
+func onToolResult(res fantasy.ToolResultContent) error {
+	if res.ToolName != "ask_player" {
+		fmt.Println("-> done")
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions
+// ---------------------------------------------------------------------------
+
+func playerTool() fantasy.AgentTool {
+	return fantasy.NewAgentTool("ask_player",
+		"Present the player with choices. You must call this whenever it is the "+
+			"player's turn to act. Provide a question and 3-5 options. Do not write "+
+			"options in your response text — this tool handles the display. The game "+
+			"cannot continue until the player chooses.",
+		askPlayer,
+	)
+}
+
+func monsterTool() fantasy.AgentTool {
+	return fantasy.NewAgentTool("lookup_monster",
+		"Look up a D&D 5e monster by name to get its real stats. Always call "+
+			"this before using any monster in the game.",
+		lookupMonster,
+	)
+}
+
+func spellTool() fantasy.AgentTool {
+	return fantasy.NewAgentTool("lookup_spell",
+		"Look up a D&D 5e spell by name to get its real details. Always call "+
+			"this before resolving a spell.",
+		lookupSpell,
+	)
+}
+
+func diceTool() fantasy.AgentTool {
+	return fantasy.NewAgentTool("roll_dice",
+		"Roll dice. Specify the number of dice, sides per die, and an optional "+
+			"modifier. Always call this — never generate random numbers yourself.",
+		rollDice,
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Tool: ask_player
+// ---------------------------------------------------------------------------
+
+type askPlayerInput struct {
+	Question string   `json:"question" description:"The question to ask the player"`
+	Options  []string `json:"options" description:"List of 3-5 options the player can choose from"`
+}
+
+func askPlayer(_ context.Context, input askPlayerInput, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	fmt.Printf("\n\n--- YOUR TURN ---\n%s\n\n", input.Question)
+	for i, opt := range input.Options {
+		fmt.Printf("  %d. %s\n", i+1, opt)
+	}
+
+	for {
+		fmt.Printf("\nChoose [1-%d]: ", len(input.Options))
+
+		if !playerScanner.Scan() {
+			return fantasy.NewTextResponse("The player has left the game."), nil
+		}
+
+		text := strings.TrimSpace(playerScanner.Text())
+		choice, err := strconv.Atoi(text)
+		if err != nil || choice < 1 || choice > len(input.Options) {
+			fmt.Printf("Pick a number between 1 and %d.\n", len(input.Options))
+			continue
+		}
+
+		chosen := input.Options[choice-1]
+		fmt.Printf("-> %s\n\n", chosen)
+		return fantasy.NewTextResponse(fmt.Sprintf("The player chose: %s", chosen)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tool: lookup_monster
+// ---------------------------------------------------------------------------
 
 type monsterQuery struct {
 	Name string `json:"name" description:"Monster name, e.g. owlbear, dragon, goblin"`
 }
 
-func lookupMonster(ctx context.Context, input monsterQuery, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+func lookupMonster(_ context.Context, input monsterQuery, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	slug := strings.ToLower(strings.ReplaceAll(input.Name, " ", "-"))
-	url := fmt.Sprintf("https://www.dnd5eapi.co/api/monsters/%s", slug)
 
-	resp, err := http.Get(url)
+	resp, err := http.Get("https://www.dnd5eapi.co/api/monsters/" + slug)
 	if err != nil {
 		return fantasy.NewTextResponse("Failed to reach D&D API"), nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fantasy.NewTextResponse(fmt.Sprintf("Monster '%s' not found in the bestiary", input.Name)), nil
+		return fantasy.NewTextResponse(fmt.Sprintf("Monster '%s' not found", input.Name)), nil
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var monster map[string]any
-	json.Unmarshal(body, &monster)
+	var m map[string]any
+	json.Unmarshal(body, &m)
 
 	summary := fmt.Sprintf(
-		"**%s** (%s %s, CR %v)\n"+
-			"AC: %v | HP: %v (%v)\n"+
-			"STR %v DEX %v CON %v INT %v WIS %v CHA %v\n"+
-			"Speed: %v",
-		monster["name"], monster["size"], monster["type"],
-		monster["challenge_rating"],
-		formatAC(monster["armor_class"]),
-		monster["hit_points"], monster["hit_dice"],
-		monster["strength"], monster["dexterity"], monster["constitution"],
-		monster["intelligence"], monster["wisdom"], monster["charisma"],
-		formatSpeed(monster["speed"]),
+		"%s (%s %s, CR %v) | AC %v | HP %v (%v)\n"+
+			"STR %v DEX %v CON %v INT %v WIS %v CHA %v | Speed: %v",
+		m["name"], m["size"], m["type"], m["challenge_rating"],
+		formatAC(m["armor_class"]), m["hit_points"], m["hit_dice"],
+		m["strength"], m["dexterity"], m["constitution"],
+		m["intelligence"], m["wisdom"], m["charisma"],
+		formatSpeed(m["speed"]),
 	)
 
-	if actions, ok := monster["actions"].([]any); ok {
-		summary += "\n\nActions:"
+	if actions, ok := m["actions"].([]any); ok {
+		summary += "\nActions:"
 		for _, a := range actions {
-			action := a.(map[string]any)
-			summary += fmt.Sprintf("\n- %s: %s", action["name"], action["desc"])
+			act := a.(map[string]any)
+			summary += fmt.Sprintf("\n- %s: %s", act["name"], act["desc"])
 		}
 	}
 
-	if abilities, ok := monster["special_abilities"].([]any); ok {
-		summary += "\n\nSpecial Abilities:"
+	if abilities, ok := m["special_abilities"].([]any); ok {
+		summary += "\nSpecial Abilities:"
 		for _, a := range abilities {
-			ability := a.(map[string]any)
-			summary += fmt.Sprintf("\n- %s: %s", ability["name"], ability["desc"])
+			ab := a.(map[string]any)
+			summary += fmt.Sprintf("\n- %s: %s", ab["name"], ab["desc"])
 		}
 	}
 
 	return fantasy.NewTextResponse(summary), nil
 }
 
-// --- Tool: Spell Lookup ---
+// ---------------------------------------------------------------------------
+// Tool: lookup_spell
+// ---------------------------------------------------------------------------
 
 type spellQuery struct {
 	Name string `json:"name" description:"Spell name, e.g. fireball, magic-missile, shield"`
 }
 
-func lookupSpell(ctx context.Context, input spellQuery, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+func lookupSpell(_ context.Context, input spellQuery, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
 	slug := strings.ToLower(strings.ReplaceAll(input.Name, " ", "-"))
-	url := fmt.Sprintf("https://www.dnd5eapi.co/api/spells/%s", slug)
 
-	resp, err := http.Get(url)
+	resp, err := http.Get("https://www.dnd5eapi.co/api/spells/" + slug)
 	if err != nil {
 		return fantasy.NewTextResponse("Failed to reach D&D API"), nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fantasy.NewTextResponse(fmt.Sprintf("Spell '%s' not found in the spellbook", input.Name)), nil
+		return fantasy.NewTextResponse(fmt.Sprintf("Spell '%s' not found", input.Name)), nil
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	var spell map[string]any
-	json.Unmarshal(body, &spell)
+	var s map[string]any
+	json.Unmarshal(body, &s)
 
 	desc := ""
-	if descs, ok := spell["desc"].([]any); ok && len(descs) > 0 {
+	if descs, ok := s["desc"].([]any); ok && len(descs) > 0 {
 		desc = fmt.Sprintf("%v", descs[0])
 	}
 
 	summary := fmt.Sprintf(
-		"**%s** (Level %v %s)\n"+
-			"Casting Time: %s | Range: %s | Duration: %s\n"+
-			"Components: %v\n\n%s",
-		spell["name"], spell["level"],
-		formatSchool(spell["school"]),
-		spell["casting_time"], spell["range"], spell["duration"],
-		spell["components"],
-		desc,
+		"%s (Level %v %s) | %s | Range: %s | Duration: %s\nComponents: %v\n%s",
+		s["name"], s["level"], formatSchool(s["school"]),
+		s["casting_time"], s["range"], s["duration"],
+		s["components"], desc,
 	)
 
-	if dmg, ok := spell["damage"].(map[string]any); ok {
+	if dmg, ok := s["damage"].(map[string]any); ok {
 		if atSlot, ok := dmg["damage_at_slot_level"].(map[string]any); ok {
-			summary += "\n\nDamage by slot level:"
-			for level, dice := range atSlot {
-				summary += fmt.Sprintf("\n  Level %s: %v", level, dice)
+			summary += "\nDamage by slot:"
+			for lvl, dice := range atSlot {
+				summary += fmt.Sprintf(" L%s=%v", lvl, dice)
 			}
 		}
 	}
@@ -253,154 +340,40 @@ func lookupSpell(ctx context.Context, input spellQuery, _ fantasy.ToolCall) (fan
 	return fantasy.NewTextResponse(summary), nil
 }
 
-// --- Tool: Dice Roller ---
+// ---------------------------------------------------------------------------
+// Tool: roll_dice
+// ---------------------------------------------------------------------------
 
 type diceQuery struct {
-	Notation string `json:"notation" description:"Dice notation like 2d6, 1d20+5, 8d6, 1d20-2"`
+	Count    int `json:"count" description:"Number of dice to roll (e.g. 2 for 2d6)"`
+	Sides    int `json:"sides" description:"Sides per die (e.g. 20 for d20)"`
+	Modifier int `json:"modifier" description:"Added to total (e.g. 5 for +5, -2 for penalty). Default 0."`
 }
 
-func rollDice(ctx context.Context, input diceQuery, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
-	notation := strings.TrimSpace(input.Notation)
-
-	var count, sides, modifier int
-	modSign := 1
-
-	mainPart := notation
-	if idx := strings.IndexAny(notation[1:], "+-"); idx >= 0 {
-		idx++
-		if notation[idx] == '-' {
-			modSign = -1
-		}
-		fmt.Sscanf(notation[idx+1:], "%d", &modifier)
-		modifier *= modSign
-		mainPart = notation[:idx]
-	}
-
-	parts := strings.SplitN(strings.ToLower(mainPart), "d", 2)
-	if len(parts) != 2 {
-		return fantasy.NewTextResponse(fmt.Sprintf("Invalid dice notation: %s", notation)), nil
-	}
-
-	count, err := strconv.Atoi(parts[0])
-	if err != nil || count <= 0 {
-		count = 1
-	}
-	sides, err = strconv.Atoi(parts[1])
-	if err != nil || sides <= 0 {
-		return fantasy.NewTextResponse(fmt.Sprintf("Invalid dice notation: %s", notation)), nil
-	}
+func rollDice(_ context.Context, input diceQuery, _ fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	count := max(input.Count, 1)
+	sides := max(input.Sides, 1)
 
 	rolls := make([]int, count)
 	total := 0
-	for i := 0; i < count; i++ {
+	for i := range count {
 		n, _ := rand.Int(rand.Reader, big.NewInt(int64(sides)))
 		rolls[i] = int(n.Int64()) + 1
 		total += rolls[i]
 	}
-	total += modifier
+	total += input.Modifier
 
-	result := fmt.Sprintf("🎲 Rolling %s: %v", notation, rolls)
-	if modifier != 0 {
-		result += fmt.Sprintf(" %+d", modifier)
+	notation := fmt.Sprintf("%dd%d", count, sides)
+	if input.Modifier != 0 {
+		notation += fmt.Sprintf("%+d", input.Modifier)
 	}
-	result += fmt.Sprintf(" = **%d**", total)
 
-	return fantasy.NewTextResponse(result), nil
+	return fantasy.NewTextResponse(fmt.Sprintf("Rolling %s: %v = %d", notation, rolls, total)), nil
 }
 
-// --- GPU Diagnostics ---
-
-func printGPUDiagnostics() {
-	dbg := func(format string, args ...any) {
-		fmt.Fprintf(os.Stderr, "[DEBUG] "+format+"\n", args...)
-	}
-
-	dbg("=== GPU Diagnostics ===")
-
-	// LD_LIBRARY_PATH
-	ldPath := os.Getenv("LD_LIBRARY_PATH")
-	if ldPath == "" {
-		dbg("LD_LIBRARY_PATH: (not set)")
-	} else {
-		dbg("LD_LIBRARY_PATH:")
-		for _, p := range strings.Split(ldPath, ":") {
-			dbg("  %s", p)
-		}
-	}
-
-	// Scan for GPU shared libraries
-	libs := map[string]bool{
-		"libcuda.so":   false,
-		"libcudart.so": false,
-		"libcublas.so": false,
-		"libnvcuda.so": false,
-		"libvulkan.so": false,
-	}
-
-	searchPaths := strings.Split(ldPath, ":")
-	searchPaths = append(searchPaths,
-		"/usr/lib/x86_64-linux-gnu",
-		"/usr/lib64",
-		"/usr/local/cuda/lib64",
-		"/run/opengl-driver/lib",
-	)
-
-	for _, dir := range searchPaths {
-		if dir == "" {
-			continue
-		}
-		for lib := range libs {
-			matches, _ := filepath.Glob(filepath.Join(dir, lib+"*"))
-			if len(matches) > 0 {
-				libs[lib] = true
-				dbg("Found %s -> %s", lib, matches[0])
-			}
-		}
-	}
-
-	dbg("Library summary:")
-	for lib, found := range libs {
-		status := "MISSING"
-		if found {
-			status = "found"
-		}
-		dbg("  %-18s %s", lib, status)
-	}
-
-	// nvidia-smi
-	dbg("--- nvidia-smi ---")
-	out, err := exec.Command("nvidia-smi",
-		"--query-gpu=name,driver_version,memory.total,memory.free,compute_cap",
-		"--format=csv,noheader",
-	).CombinedOutput()
-	if err != nil {
-		dbg("nvidia-smi: %v (is the NVIDIA driver installed?)", err)
-	} else {
-		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			dbg("  %s", line)
-		}
-	}
-
-	// Relevant env vars
-	dbg("--- Environment ---")
-	for _, key := range []string{
-		"CUDA_VISIBLE_DEVICES",
-		"GGML_VK_VISIBLE_DEVICES",
-		"GGML_BACKEND",
-		"CUDA_PATH",
-		"VULKAN_SDK",
-	} {
-		if v := os.Getenv(key); v != "" {
-			dbg("  %s=%s", key, v)
-		} else {
-			dbg("  %s=(not set)", key)
-		}
-	}
-
-	dbg("=== End Diagnostics ===\n")
-}
-
-// --- Helpers ---
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 func formatAC(ac any) string {
 	if arr, ok := ac.([]any); ok && len(arr) > 0 {
@@ -412,14 +385,15 @@ func formatAC(ac any) string {
 }
 
 func formatSpeed(speed any) string {
-	if m, ok := speed.(map[string]any); ok {
-		parts := []string{}
-		for k, v := range m {
-			parts = append(parts, fmt.Sprintf("%s %v", k, v))
-		}
-		return strings.Join(parts, ", ")
+	m, ok := speed.(map[string]any)
+	if !ok {
+		return "?"
 	}
-	return "?"
+	parts := make([]string, 0, len(m))
+	for k, v := range m {
+		parts = append(parts, fmt.Sprintf("%s %v", k, v))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatSchool(school any) string {
